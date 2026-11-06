@@ -1,0 +1,395 @@
+<core:FragmentDefinition
+    xmlns="sap.m"
+    xmlns:core="sap.ui.core">
+
+    <Dialog
+        id="setupDialog"
+        title="Settings"
+        icon="sap-icon://action-settings"
+        contentWidth="38rem"
+        draggable="true"
+        resizable="true"
+        escapeHandler=".onSetupEscape"
+        class="setupDialog">
+
+        <content>
+
+            <VBox class="sapUiSmallMargin">
+
+                <Text
+                    visible="{= !${setup>/configured} }"
+                    text="Welcome! iFlow Studio needs access to the adesso AI Hub before it can generate integration flows. Choose a model, enter its API key and click Save."
+                    class="sapUiSmallMarginBottom"/>
+
+                <Text
+                    visible="{setup>/configured}"
+                    text="The primary model is always tried first. If it fails, iFlow Studio automatically switches to the secondary model."
+                    class="sapUiSmallMarginBottom"/>
+
+                <MessageStrip
+                    visible="{= !${setup>/canSave} }"
+                    type="Information"
+                    showIcon="true"
+                    text="This instance runs in production. Settings are managed by your administrator through the app's environment variables."
+                    class="sapUiSmallMarginBottom"/>
+
+                <!-- Primary model -->
+                <Panel
+                    expandable="false"
+                    class="settingsSlot">
+
+                    <headerToolbar>
+                        <Toolbar>
+                            <core:Icon src="sap-icon://favorite"/>
+                            <Title text="Primary model" level="H4"/>
+                            <ToolbarSpacer/>
+                            <ObjectStatus
+                                text="{setup>/primary/statusText}"
+                                state="{setup>/primary/statusState}"
+                                icon="{setup>/primary/statusIcon}"/>
+                        </Toolbar>
+                    </headerToolbar>
+
+                    <VBox>
+
+                        <Text
+                            text="Used for every request."
+                            class="setupHelp sapUiTinyMarginBottom"/>
+
+                        <Label
+                            text="Model"
+                            labelFor="primaryModel"
+                            required="true"/>
+
+                        <ComboBox
+                            id="primaryModel"
+                            width="100%"
+                            value="{setup>/primary/model}"
+                            items="{path: 'setup>/models', templateShareable: false}"
+                            placeholder="Select or type a model name"
+                            change=".onSettingsChange"
+                            enabled="{setup>/canSave}">
+                            <core:Item key="{setup>}" text="{setup>}"/>
+                        </ComboBox>
+
+                        <Label
+                            text="API key"
+                            labelFor="primaryApiKey"
+                            required="{= !${setup>/primary/configured} }"
+                            class="sapUiSmallMarginTop"/>
+
+                        <HBox alignItems="Center">
+
+                            <Input
+                                id="primaryApiKey"
+                                value="{setup>/primary/apiKey}"
+                                type="{= ${setup>/showKeys} ? 'Text' : 'Password' }"
+                                placeholder="{= ${setup>/primary/configured} ? 'Saved key: ' + ${setup>/primary/keyHint} + ' (leave empty to keep)' : 'sk-...' }"
+                                valueState="{setup>/primary/apiKeyState}"
+                                valueStateText="{setup>/primary/apiKeyStateText}"
+                                liveChange=".onSettingsChange"
+                                enabled="{setup>/canSave}"
+                                width="100%">
+                                <layoutData>
+                                    <FlexItemData growFactor="1"/>
+                                </layoutData>
+                            </Input>
+
+                            <Button
+                                text="Test"
+                                icon="sap-icon://connected"
+                                press=".onTestSlot"
+                                busy="{setup>/primary/testing}"
+                                enabled="{setup>/canSave}"
+                                class="sapUiTinyMarginBegin">
+                                <customData>
+                                    <core:CustomData key="slot" value="primary"/>
+                                </customData>
+                            </Button>
+
+                        </HBox>
+
+                        <Label
+                            text="AI Hub URL"
+                            labelFor="primaryUrl"
+                            class="sapUiSmallMarginTop"/>
+
+                        <Input
+                            id="primaryUrl"
+                            value="{setup>/primary/url}"
+                            placeholder="https://adesso-ai-hub.3asabc.de/v1"
+                            liveChange=".onSettingsChange"
+                            enabled="{setup>/canSave}"/>
+
+                        <MessageStrip
+                            visible="{= !!${setup>/primary/message} }"
+                            text="{setup>/primary/message}"
+                            type="{setup>/primary/messageType}"
+                            showIcon="true"
+                            class="sapUiSmallMarginTop"/>
+
+                    </VBox>
+
+                </Panel>
+
+
+                <!-- Secondary model -->
+                <Panel
+                    expandable="false"
+                    class="settingsSlot">
+
+                    <headerToolbar>
+                        <Toolbar>
+                            <core:Icon src="sap-icon://switch-views"/>
+                            <Title text="Secondary model" level="H4"/>
+                            <ToolbarSpacer/>
+                            <ObjectStatus
+                                text="{setup>/secondary/statusText}"
+                                state="{setup>/secondary/statusState}"
+                                icon="{setup>/secondary/statusIcon}"/>
+                        </Toolbar>
+                    </headerToolbar>
+
+                    <VBox>
+
+                        <Text
+                            text="Optional. Used automatically when the primary model fails, with its own API key."
+                            class="setupHelp sapUiTinyMarginBottom"/>
+
+                        <Label
+                            text="Model"
+                            labelFor="secondaryModel"
+                            required="false"/>
+
+                        <ComboBox
+                            id="secondaryModel"
+                            width="100%"
+                            value="{setup>/secondary/model}"
+                            items="{path: 'setup>/models', templateShareable: false}"
+                            placeholder="Select or type a model name"
+                            change=".onSettingsChange"
+                            enabled="{setup>/canSave}">
+                            <core:Item key="{setup>}" text="{setup>}"/>
+                        </ComboBox>
+
+                        <Label
+                            text="API key"
+                            labelFor="secondaryApiKey"
+                            required="false"
+                            class="sapUiSmallMarginTop"/>
+
+                        <HBox alignItems="Center">
+
+                            <Input
+                                id="secondaryApiKey"
+                                value="{setup>/secondary/apiKey}"
+                                type="{= ${setup>/showKeys} ? 'Text' : 'Password' }"
+                                placeholder="{= ${setup>/secondary/configured} ? 'Saved key: ' + ${setup>/secondary/keyHint} + ' (leave empty to keep)' : 'sk-...' }"
+                                valueState="{setup>/secondary/apiKeyState}"
+                                valueStateText="{setup>/secondary/apiKeyStateText}"
+                                liveChange=".onSettingsChange"
+                                enabled="{setup>/canSave}"
+                                width="100%">
+                                <layoutData>
+                                    <FlexItemData growFactor="1"/>
+                                </layoutData>
+                            </Input>
+
+                            <Button
+                                text="Test"
+                                icon="sap-icon://connected"
+                                press=".onTestSlot"
+                                busy="{setup>/secondary/testing}"
+                                enabled="{setup>/canSave}"
+                                class="sapUiTinyMarginBegin">
+                                <customData>
+                                    <core:CustomData key="slot" value="secondary"/>
+                                </customData>
+                            </Button>
+
+                        </HBox>
+
+                        <Label
+                            text="AI Hub URL"
+                            labelFor="secondaryUrl"
+                            class="sapUiSmallMarginTop"/>
+
+                        <Input
+                            id="secondaryUrl"
+                            value="{setup>/secondary/url}"
+                            placeholder="https://adesso-ai-hub.3asabc.de/v1"
+                            liveChange=".onSettingsChange"
+                            enabled="{setup>/canSave}"/>
+
+                        <Button
+                            text="Remove secondary model"
+                            icon="sap-icon://delete"
+                            type="Transparent"
+                            visible="{setup>/secondary/configured}"
+                            enabled="{setup>/canSave}"
+                            press=".onClearSecondary"
+                            class="sapUiTinyMarginTop"/>
+
+                        <MessageStrip
+                            visible="{= !!${setup>/secondary/message} }"
+                            text="{setup>/secondary/message}"
+                            type="{setup>/secondary/messageType}"
+                            showIcon="true"
+                            class="sapUiSmallMarginTop"/>
+
+                    </VBox>
+
+                </Panel>
+
+
+                <!-- CPI tenant (deployment) -->
+                <Panel
+                    expandable="false"
+                    class="settingsSlot">
+
+                    <headerToolbar>
+                        <Toolbar>
+                            <core:Icon src="sap-icon://upload-to-cloud"/>
+                            <Title text="CPI tenant (for Deploy)" level="H4"/>
+                            <ToolbarSpacer/>
+                            <ObjectStatus
+                                text="{setup>/cpi/statusText}"
+                                state="{setup>/cpi/statusState}"
+                                icon="{setup>/cpi/statusIcon}"/>
+                        </Toolbar>
+                    </headerToolbar>
+
+                    <VBox>
+
+                        <Text
+                            text="Optional. Needed only for the Deploy button. Copy the values from a service key of the Process Integration Runtime service (plan &quot;api&quot;) in the BTP cockpit."
+                            class="setupHelp sapUiTinyMarginBottom"/>
+
+                        <Label
+                            text="Client ID"
+                            labelFor="cpiClientId"
+                            required="true"
+                            class="sapUiSmallMarginTop"/>
+
+                        <Input
+                            id="cpiClientId"
+                            value="{setup>/cpi/clientId}"
+                            placeholder="clientid from the service key"
+                            liveChange=".onSettingsChange"
+                            enabled="{setup>/canSave}"/>
+
+
+                        <Label
+                            text="Client secret"
+                            labelFor="cpiClientSecret"
+                            required="true"
+                            class="sapUiSmallMarginTop"/>
+
+                        <Input
+                            id="cpiClientSecret"
+                            value="{setup>/cpi/clientSecret}"
+                            placeholder="{= ${setup>/cpi/secretHint} ? 'Saved: ' + ${setup>/cpi/secretHint} + ' (leave empty to keep)' : 'clientsecret from the service key' }"
+                            type="{= ${setup>/showKeys} ? 'Text' : 'Password' }"
+                            liveChange=".onSettingsChange"
+                            enabled="{setup>/canSave}"/>
+
+
+                        <Label
+                            text="Token URL"
+                            labelFor="cpiTokenUrl"
+                            required="true"
+                            class="sapUiSmallMarginTop"/>
+
+                        <Input
+                            id="cpiTokenUrl"
+                            value="{setup>/cpi/tokenUrl}"
+                            placeholder="https://&lt;subdomain&gt;.authentication.&lt;region&gt;.hana.ondemand.com/oauth/token"
+                            liveChange=".onSettingsChange"
+                            enabled="{setup>/canSave}"/>
+
+
+                        <Label
+                            text="API base URL"
+                            labelFor="cpiApiBaseUrl"
+                            required="true"
+                            class="sapUiSmallMarginTop"/>
+
+                        <Input
+                            id="cpiApiBaseUrl"
+                            value="{setup>/cpi/apiBaseUrl}"
+                            placeholder="https://&lt;tenant&gt;.it-cpi&lt;nr&gt;.cfapps.&lt;region&gt;.hana.ondemand.com"
+                            liveChange=".onSettingsChange"
+                            enabled="{setup>/canSave}"/>
+
+
+                        <Label
+                            text="Package ID"
+                            labelFor="cpiPackageId"
+                            required="false"
+                            class="sapUiSmallMarginTop"/>
+
+                        <Input
+                            id="cpiPackageId"
+                            value="{setup>/cpi/packageId}"
+                            placeholder="cpipackage"
+                            liveChange=".onSettingsChange"
+                            enabled="{setup>/canSave}"/>
+
+                        <HBox justifyContent="End" class="sapUiTinyMarginTop">
+                            <Button
+                                text="Test"
+                                icon="sap-icon://connected"
+                                press=".onTestSlot"
+                                busy="{setup>/cpi/testing}"
+                                enabled="{setup>/canSave}">
+                                <customData>
+                                    <core:CustomData key="slot" value="cpi"/>
+                                </customData>
+                            </Button>
+                        </HBox>
+
+                        <MessageStrip
+                            visible="{= !!${setup>/cpi/message} }"
+                            text="{setup>/cpi/message}"
+                            type="{setup>/cpi/messageType}"
+                            showIcon="true"
+                            class="sapUiSmallMarginTop"/>
+
+                    </VBox>
+
+                </Panel>
+
+                <CheckBox
+                    text="Show keys and secrets"
+                    selected="{setup>/showKeys}"/>
+
+                <MessageStrip
+                    visible="{= !!${setup>/message} }"
+                    text="{setup>/message}"
+                    type="{setup>/messageType}"
+                    showIcon="true"
+                    class="sapUiSmallMarginTop"/>
+
+            </VBox>
+
+        </content>
+
+        <buttons>
+
+            <Button
+                text="Save"
+                type="Emphasized"
+                icon="sap-icon://save"
+                press=".onSaveSetup"
+                busy="{setup>/saving}"
+                enabled="{setup>/canSave}"/>
+
+            <Button
+                text="Close"
+                press=".onCloseSetup"/>
+
+        </buttons>
+
+    </Dialog>
+
+</core:FragmentDefinition>

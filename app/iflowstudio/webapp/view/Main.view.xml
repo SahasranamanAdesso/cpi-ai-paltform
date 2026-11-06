@@ -36,10 +36,24 @@
                         </VBox>
                     </HBox>
 
-                    <ObjectStatus
-                        text="Ready"
-                        state="Success"
-                        icon="sap-icon://status-positive"/>
+                    <HBox alignItems="Center">
+
+                        <ObjectStatus
+                            text="{setup>/headerText}"
+                            state="{setup>/headerState}"
+                            icon="{setup>/headerIcon}"
+                            active="true"
+                            press=".onOpenSetup"
+                            tooltip="{setup>/lastFallbackReason}"/>
+
+                        <Button
+                            icon="sap-icon://action-settings"
+                            tooltip="AI Hub connection settings"
+                            type="Transparent"
+                            press=".onOpenSetup"
+                            class="sapUiSmallMarginBegin"/>
+
+                    </HBox>
                 </HBox>
 
 
@@ -125,6 +139,15 @@ Receive orders through HTTPS. Validate the order. Route domestic and internation
                             class="generateRow">
 
                             <Button
+                                id="deployButton"
+                                text="Deploy to CPI"
+                                icon="sap-icon://upload-to-cloud"
+                                press=".onDeploy"
+                                enabled="{= ${deploy>/status} !== 'RUNNING' }"
+                                tooltip="Deploy the flow you generated (or generate one from the scenario if you have not yet) to your CPI tenant"
+                                class="sapUiSmallMarginEnd"/>
+
+                            <Button
                                 id="generateButton"
                                 text="Generate Integration Flow"
                                 icon="sap-icon://process"
@@ -135,6 +158,184 @@ Receive orders through HTTPS. Validate the order. Route domestic and internation
                                 class="generateButton"/>
 
                         </HBox>
+
+                    </VBox>
+
+                </content>
+
+            </Panel>
+
+
+            <!-- Deployment -->
+            <Panel
+                id="deployPanel"
+                headerText="Deployment"
+                visible="{= !!${deploy>/deploymentId} }"
+                class="scenarioCard">
+
+                <content>
+
+                    <VBox>
+
+                        <HBox
+                            justifyContent="SpaceBetween"
+                            alignItems="Center">
+
+                            <VBox>
+                                <Title
+                                    text="{= ${deploy>/artifactId} ? ${deploy>/artifactId} : 'New integration flow' }"
+                                    level="H3"/>
+                                <Text
+                                    text="{= 'Package ' + ${deploy>/packageId} + ' · attempt ' + ${deploy>/attempt} + ' of ' + ${deploy>/maxAttempts} }"/>
+                            </VBox>
+
+                            <ObjectStatus
+                                text="{deploy>/statusText}"
+                                state="{deploy>/statusState}"
+                                icon="{deploy>/statusIcon}"
+                                class="sapMObjectStatusLarge"/>
+
+                        </HBox>
+
+                        <HBox
+                            alignItems="Center"
+                            visible="{= ${deploy>/status} === 'RUNNING' }"
+                            class="sapUiSmallMarginTop">
+                            <BusyIndicator size="1rem" class="sapUiTinyMarginEnd"/>
+                            <Text text="{deploy>/phase}"/>
+                        </HBox>
+
+                        <MessageStrip
+                            visible="{= ${deploy>/status} === 'STARTED' }"
+                            type="Success"
+                            showIcon="true"
+                            text="{deploy>/phase}"
+                            class="sapUiSmallMarginTop"/>
+
+                        <!-- Error details -->
+                        <VBox
+                            visible="{= !!${deploy>/error} &amp;&amp; ${deploy>/status} !== 'RUNNING' }"
+                            class="sapUiSmallMarginTop">
+
+                            <MessageStrip
+                                type="Error"
+                                showIcon="true"
+                                text="{deploy>/phase}"/>
+
+                            <Label
+                                text="Error reported by SAP"
+                                design="Bold"
+                                class="sapUiSmallMarginTop"/>
+
+                            <TextArea
+                                value="{deploy>/error}"
+                                editable="false"
+                                growing="true"
+                                growingMaxLines="12"
+                                width="100%"
+                                class="deployError"/>
+
+                            <Panel
+                                expandable="true"
+                                expanded="false"
+                                headerText="Raw error details"
+                                visible="{= !!${deploy>/errorDetail} }">
+                                <TextArea
+                                    value="{deploy>/errorDetail}"
+                                    editable="false"
+                                    growing="true"
+                                    growingMaxLines="20"
+                                    width="100%"
+                                    class="deployError"/>
+                            </Panel>
+
+                        </VBox>
+
+                        <Toolbar
+                            visible="{= ${deploy>/status} !== 'RUNNING' }"
+                            style="Clear"
+                            class="sapUiSmallMarginTop">
+
+                            <ToolbarSpacer/>
+
+                            <Button
+                                text="Fix &amp; Redeploy"
+                                icon="sap-icon://wrench"
+                                type="Emphasized"
+                                visible="{deploy>/canFix}"
+                                tooltip="Send the SAP error to the AI, regenerate the flow and deploy it again"
+                                press=".onFixAndRedeploy"/>
+
+                            <Button
+                                text="Deploy again"
+                                icon="sap-icon://upload-to-cloud"
+                                visible="{= ${deploy>/status} === 'STARTED' }"
+                                press=".onDeploy"/>
+
+                        </Toolbar>
+
+                    </VBox>
+
+                </content>
+
+            </Panel>
+
+
+            <!-- Tenant errors -->
+            <Panel
+                headerText="Flows with deployment errors on the tenant"
+                expandable="true"
+                expanded="false"
+                expand=".onTenantErrorsExpand"
+                class="scenarioCard">
+
+                <headerToolbar>
+                    <Toolbar>
+                        <Title text="Flows with deployment errors on the tenant" level="H4"/>
+                        <ToolbarSpacer/>
+                        <Button
+                            icon="sap-icon://refresh"
+                            text="Check"
+                            tooltip="Load all flows currently in ERROR status"
+                            busy="{deploy>/loadingErrors}"
+                            press=".onLoadTenantErrors"/>
+                    </Toolbar>
+                </headerToolbar>
+
+                <content>
+
+                    <VBox>
+
+                        <Text
+                            visible="{= !${deploy>/tenantErrorsLoaded} }"
+                            text="Click Check to load flows that are currently in ERROR status on your CPI tenant."/>
+
+                        <MessageStrip
+                            visible="{= !!${deploy>/tenantErrorsMessage} }"
+                            text="{deploy>/tenantErrorsMessage}"
+                            type="{deploy>/tenantErrorsMessageType}"
+                            showIcon="true"/>
+
+                        <List
+                            items="{deploy>/tenantErrors}"
+                            visible="{= ${deploy>/tenantErrors}.length > 0 }"
+                            noDataText="No flows in ERROR status.">
+                            <CustomListItem>
+                                <VBox class="sapUiSmallMargin">
+                                    <HBox justifyContent="SpaceBetween">
+                                        <Title text="{deploy>artifactName}" level="H5"/>
+                                        <ObjectStatus text="ERROR" state="Error" icon="sap-icon://status-negative"/>
+                                    </HBox>
+                                    <Text
+                                        text="{= ${deploy>artifactId} + (${deploy>deployedBy} ? ' · deployed by ' + ${deploy>deployedBy} : '') }"
+                                        class="setupHelp"/>
+                                    <Text
+                                        text="{deploy>error}"
+                                        wrapping="true"
+                                        class="sapUiTinyMarginTop deployErrorText"/>
+                                </VBox>
+                            </CustomListItem>
+                        </List>
 
                     </VBox>
 

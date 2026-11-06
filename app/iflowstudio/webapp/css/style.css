@@ -104,3 +104,30 @@
 .actionToolbar {
     margin-top: 1rem;
 }
+/* Setup dialog */
+
+.setupHelp {
+    color: #5f6b7a;
+    font-size: 0.8125rem;
+    margin-top: 0.25rem;
+}
+
+.setupAdvanced {
+    margin-top: 0.5rem;
+}
+
+.settingsSlot {
+    margin-bottom: 0.75rem;
+}
+
+/* Deployment */
+
+.deployError textarea {
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 0.8125rem;
+}
+
+.deployErrorText {
+    color: #aa0808;
+    white-space: pre-wrap;
+}

@@ -1,12 +1,20 @@
 const cds = require("@sap/cds");
 const axios = require("axios");
 const { Readable } = require("stream");
+const fs = require("fs");
+const path = require("path");
 
 const {
   fromJson,
   validate,
-  compileToZip
+  compileToZip,
+  getRequiredInputs,
+  applyInputs,
+  withDraftPlaceholders
 } = require("@cpi-ai/compiler");
+
+const tenant = require("./cpi-tenant");
+const { CpiDeployer } = require("@david10ten/deployer");
 
 module.exports = cds.service.impl(function () {
 
@@ -559,10 +567,624 @@ Return ONLY the complete compiler JSON.
 
 
   // ============================================================
+  // AI HUB CONFIGURATION
+  //
+  // Two model slots: the primary model is always tried first,
+  // the secondary model (with its own API key) is used when the
+  // primary request fails.
+  //
+  // Locally the values are edited in the Settings dialog of
+  // iFlow Studio and stored in .env (git-ignored).
+  // On BTP they come from the app's environment variables.
+  // ============================================================
+
+  const DEFAULT_AI_HUB_URL =
+    "https://adesso-ai-hub.3asabc.de/v1";
+
+  // Offered in the model dropdown. Any other name can be typed in.
+  const AVAILABLE_MODELS = [
+    "gemma-4-26b-sovereign",
+    "deepseek-v4-flash-sovereign",
+    "qwen-3.6-35b-sovereign",
+    "claude-sonnet-4-6",
+    "claude-sonnet-5",
+    "claude-opus-4-8",
+    "claude-haiku-4-5",
+    "gpt-5",
+    "gpt-5-mini",
+    "gpt-5.5",
+    "gpt-4.1",
+    "gpt-4o",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-3.5-flash",
+    "llama-3-3-70b",
+    "qwen3-235b"
+  ];
+
+  const SLOTS = {
+    primary: {
+      prefix: "AI_HUB",
+      label: "Primary",
+      defaultModel: "gemma-4-26b-sovereign"
+    },
+    secondary: {
+      prefix: "AI_HUB_SECONDARY",
+      label: "Secondary",
+      defaultModel: "claude-sonnet-4-6"
+    }
+  };
+
+  const ENV_FILE =
+    path.join(cds.root, ".env");
+
+  // Writing .env from the browser is a local-development
+  // convenience only. In production the dialog is read-only.
+  const CAN_SAVE_SETUP =
+    process.env.NODE_ENV !== "production" &&
+    !cds.env.profiles?.includes("production");
+
+  // Result of the last real AI request, shown in the header
+  const lastCall = {
+    model: null,
+    slot: null,
+    at: null,
+    fallbackReason: null
+  };
+
+  function normalizeUrl(url) {
+    return (url || "").trim().replace(/\/+$/, "");
+  }
+
+  function readSlot(slot) {
+
+    const { prefix, defaultModel } = SLOTS[slot];
+
+    return {
+      slot,
+      label: SLOTS[slot].label,
+      apiKey: process.env[`${prefix}_API_KEY`] || "",
+      url:
+        normalizeUrl(process.env[`${prefix}_URL`]) ||
+        DEFAULT_AI_HUB_URL,
+      model:
+        process.env[`${prefix}_MODEL`] ||
+        defaultModel
+    };
+  }
+
+  // Configured slots in the order they should be tried
+  function getAiHubConfigs() {
+
+    const configs =
+      ["primary", "secondary"]
+        .map(readSlot)
+        .filter((c) => c.apiKey);
+
+    if (!configs.length) {
+      throw new Error(
+        "AI Hub is not configured yet. Click the gear icon at " +
+        "the top right of iFlow Studio and enter an API key."
+      );
+    }
+
+    return configs;
+  }
+
+  function maskKey(key) {
+
+    if (!key) {
+      return "";
+    }
+
+    if (key.length <= 8) {
+      return "*".repeat(key.length);
+    }
+
+    return `${key.slice(0, 3)}******${key.slice(-4)}`;
+  }
+
+  // CPI tenant (Process Integration Runtime service key, plan "api")
+  function readCpi() {
+    return {
+      clientId: process.env.CPI_CLIENT_ID || "",
+      clientSecret: process.env.CPI_CLIENT_SECRET || "",
+      tokenUrl: process.env.CPI_TOKEN_URL || "",
+      apiBaseUrl: process.env.CPI_API_BASE_URL || "",
+      packageId: process.env.CPI_PACKAGE_ID || "cpipackage"
+    };
+  }
+
+  function cpiStatus() {
+
+    const c = readCpi();
+
+    let configured = false;
+
+    try {
+      // Also true when an it-rt service is bound on BTP
+      require("@david10ten/deployer").resolveCredentials();
+      configured = true;
+    } catch (e) {
+      configured = false;
+    }
+
+    return {
+      configured,
+      clientId: c.clientId,
+      secretHint: maskKey(c.clientSecret),
+      tokenUrl: c.tokenUrl,
+      apiBaseUrl: c.apiBaseUrl,
+      packageId: c.packageId
+    };
+  }
+
+  // Empty secret means "keep the current one"
+  function resolveCpiInput(data = {}) {
+
+    const current = readCpi();
+    const trim = (v) => (v || "").trim();
+
+    return {
+      clientId: trim(data.clientId),
+      clientSecret: trim(data.clientSecret) || current.clientSecret,
+      tokenUrl: trim(data.tokenUrl),
+      apiBaseUrl: normalizeUrl(data.apiBaseUrl),
+      packageId: trim(data.packageId) || "cpipackage"
+    };
+  }
+
+  // Fetches an OAuth token and lists packages: checks the token
+  // URL, the client credentials and the API base URL
+  async function testCpi(cpi) {
+
+    const missing = [
+      ["clientId", "Client ID"],
+      ["clientSecret", "Client secret"],
+      ["tokenUrl", "Token URL"],
+      ["apiBaseUrl", "API base URL"]
+    ].filter(([k]) => !cpi[k]).map(([, label]) => label);
+
+    if (missing.length) {
+      return {
+        slot: "cpi",
+        ok: false,
+        message: `Missing: ${missing.join(", ")}.`
+      };
+    }
+
+    try {
+
+      const deployer = new CpiDeployer({ credentials: cpi });
+      const token = await deployer.getAccessToken();
+
+      await axios.get(
+        `${cpi.apiBaseUrl}/api/v1/IntegrationPackages('${encodeURIComponent(cpi.packageId)}')`,
+        {
+          timeout: 20000,
+          headers: { Authorization: `Bearer ${token}`, Accept: "application/json" }
+        }
+      ).catch((error) => {
+        if (error.response?.status === 404) {
+          throw Object.assign(
+            new Error(`Connected, but package "${cpi.packageId}" does not exist on the tenant.`),
+            { packageMissing: true }
+          );
+        }
+        throw error;
+      });
+
+      return {
+        slot: "cpi",
+        ok: true,
+        message: `Connected. Package "${cpi.packageId}" found.`
+      };
+
+    } catch (error) {
+
+      if (error.packageMissing) {
+        return { slot: "cpi", ok: false, message: error.message };
+      }
+
+      const isTokenCall =
+        error.config?.url === cpi.tokenUrl;
+
+      if (isTokenCall && error.response?.status === 401) {
+        return {
+          slot: "cpi",
+          ok: false,
+          message: "Client ID or secret was rejected by the token URL."
+        };
+      }
+
+      return {
+        slot: "cpi",
+        ok: false,
+        message:
+          (isTokenCall ? "Token request failed: " : "") +
+          (error.response ? describeCpiError(error) : `Could not reach ${error.config?.url || "the tenant"} (${error.code || error.message}).`)
+      };
+    }
+  }
+
+  function getSetupStatus() {
+
+    const slotStatus = (slot) => {
+      const c = readSlot(slot);
+      return {
+        configured: !!c.apiKey,
+        url: c.url,
+        model: c.model,
+        keyHint: maskKey(c.apiKey)
+      };
+    };
+
+    const primary = slotStatus("primary");
+    const secondary = slotStatus("secondary");
+
+    return {
+      configured: primary.configured || secondary.configured,
+      canSave: CAN_SAVE_SETUP,
+      envFile: ENV_FILE,
+      models: AVAILABLE_MODELS,
+      primary,
+      secondary,
+      cpi: cpiStatus(),
+      lastModel: lastCall.model,
+      lastSlot: lastCall.slot,
+      lastAt: lastCall.at,
+      lastFallbackReason: lastCall.fallbackReason
+    };
+  }
+
+  function describeAiError(error) {
+
+    const status =
+      error.response?.status;
+
+    const detail =
+      error.response?.data?.error?.message ||
+      error.message;
+
+    if (status === 401) {
+      return "API key was rejected. Check that it is correct and still valid.";
+    }
+
+    // 403 also means "model not allowed for this key", so pass
+    // the AI Hub's own explanation through
+    if (status === 403) {
+      return `Access denied: ${detail}`;
+    }
+
+    if (status === 404) {
+      return `URL or model not found (${detail}).`;
+    }
+
+    if (status) {
+      return `AI Hub answered with HTTP ${status}: ${detail}`;
+    }
+
+    return "AI Hub could not be reached. Check the URL and your " +
+      `network or VPN (${error.code || detail}).`;
+  }
+
+  function postChat(config, body, timeout) {
+
+    return axios.post(
+      `${config.url}/chat/completions`,
+      Object.assign({ model: config.model }, body),
+      {
+        timeout,
+        headers: {
+          Authorization: `Bearer ${config.apiKey}`,
+          "Content-Type": "application/json"
+        }
+      }
+    );
+  }
+
+  // Calls the primary model and falls back to the secondary one
+  async function callAiWithFallback(body) {
+
+    const configs = getAiHubConfigs();
+    const failures = [];
+
+    for (const config of configs) {
+
+      try {
+
+        console.log(
+          `AI request -> ${config.label} model "${config.model}"`
+        );
+
+        const response =
+          await postChat(config, body, 180000);
+
+        lastCall.model = config.model;
+        lastCall.slot = config.slot;
+        lastCall.at = new Date().toISOString();
+        lastCall.fallbackReason =
+          failures.length ? failures.join(" | ") : null;
+
+        return response;
+
+      } catch (error) {
+
+        const reason =
+          `${config.label} (${config.model}): ${describeAiError(error)}`;
+
+        console.error(
+          "AI request failed:",
+          reason,
+          error.response?.data || ""
+        );
+
+        failures.push(reason);
+      }
+    }
+
+    throw new Error(
+      failures.length > 1
+        ? `Both AI models failed. ${failures.join(" ")}`
+        : `AI request failed. ${failures[0]}`
+    );
+  }
+
+  // Resolves one slot from the dialog. An empty key means
+  // "keep the key that is already configured".
+  function resolveSlotInput(slot, data = {}) {
+
+    const current = readSlot(slot);
+
+    return {
+      slot,
+      label: SLOTS[slot].label,
+      apiKey: (data.apiKey || "").trim() || current.apiKey,
+      url: normalizeUrl(data.url) || DEFAULT_AI_HUB_URL,
+      model: (data.model || "").trim() || SLOTS[slot].defaultModel
+    };
+  }
+
+  function validateSlot(config) {
+
+    if (!/^https?:\/\/\S+$/.test(config.url)) {
+      return `${config.label}: the URL must start with http:// or https://`;
+    }
+
+    return null;
+  }
+
+  // Sends a minimal chat request, which checks URL, key and
+  // model in one go.
+  async function testSlot(config) {
+
+    if (!config.apiKey) {
+      return {
+        slot: config.slot,
+        ok: false,
+        message: "No API key entered."
+      };
+    }
+
+    const invalid = validateSlot(config);
+
+    if (invalid) {
+      return { slot: config.slot, ok: false, message: invalid };
+    }
+
+    try {
+
+      await postChat(
+        config,
+        {
+          max_tokens: 1,
+          messages: [{ role: "user", content: "ping" }]
+        },
+        20000
+      );
+
+      return {
+        slot: config.slot,
+        ok: true,
+        message: `Connected. "${config.model}" is responding.`
+      };
+
+    } catch (error) {
+
+      return {
+        slot: config.slot,
+        ok: false,
+        message: describeAiError(error)
+      };
+    }
+  }
+
+  function writeEnvFile(values) {
+
+    const lines =
+      fs.existsSync(ENV_FILE)
+        ? fs.readFileSync(ENV_FILE, "utf8").split(/\r?\n/)
+        : [
+          "# Local credentials for cpi-ai-platform.",
+          "# Managed by the iFlow Studio settings dialog. Do NOT commit."
+        ];
+
+    const written = new Set();
+
+    // Update existing entries in place, keep everything else
+    const updated = lines
+      .map((line) => {
+
+        const key =
+          line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=/)?.[1];
+
+        if (key && key in values) {
+          written.add(key);
+          return values[key] === null ? null : `${key}=${values[key]}`;
+        }
+
+        return line;
+      })
+      .filter((line) => line !== null);
+
+    while (updated.length && !updated[updated.length - 1].trim()) {
+      updated.pop();
+    }
+
+    for (const [key, value] of Object.entries(values)) {
+      if (!written.has(key) && value !== null) {
+        updated.push(`${key}=${value}`);
+      }
+    }
+
+    fs.writeFileSync(
+      ENV_FILE,
+      updated.join("\n") + "\n",
+      { mode: 0o600 }
+    );
+  }
+
+  this.on(
+    "getSetupStatus",
+    () => getSetupStatus()
+  );
+
+  this.on(
+    "testSetup",
+    async (req) => {
+
+      if (req.data.slot === "cpi") {
+        return testCpi(resolveCpiInput(req.data.cpi));
+      }
+
+      const slot =
+        req.data.slot === "secondary" ? "secondary" : "primary";
+
+      return testSlot(
+        resolveSlotInput(slot, req.data)
+      );
+    }
+  );
+
+  this.on(
+    "saveSetup",
+    async (req) => {
+
+      if (!CAN_SAVE_SETUP) {
+        return req.error(
+          403,
+          "Settings cannot be changed from the browser in " +
+          "production. Set the AI_HUB_* environment variables " +
+          "of the app instead."
+        );
+      }
+
+      const primary =
+        resolveSlotInput("primary", req.data.primary);
+
+      const secondary =
+        resolveSlotInput("secondary", req.data.secondary);
+
+      if (req.data.secondary?.clear) {
+        secondary.apiKey = "";
+      }
+
+      if (!primary.apiKey) {
+        return req.error(400, "Please enter an API key for the primary model.");
+      }
+
+      const invalid =
+        validateSlot(primary) ||
+        (secondary.apiKey && validateSlot(secondary));
+
+      if (invalid) {
+        return req.error(400, invalid);
+      }
+
+      const values = {};
+
+      for (const config of [primary, secondary]) {
+
+        const { prefix } = SLOTS[config.slot];
+        const unset = !config.apiKey;
+
+        values[`${prefix}_API_KEY`] = unset ? null : config.apiKey;
+        values[`${prefix}_URL`] = unset ? null : config.url;
+        values[`${prefix}_MODEL`] = unset ? null : config.model;
+      }
+
+      // CPI section is optional; saved when anything was entered
+      const cpi =
+        resolveCpiInput(req.data.cpi);
+
+      const hasCpi =
+        cpi.clientId || cpi.tokenUrl || cpi.apiBaseUrl;
+
+      if (hasCpi) {
+        values.CPI_CLIENT_ID = cpi.clientId;
+        values.CPI_CLIENT_SECRET = cpi.clientSecret;
+        values.CPI_TOKEN_URL = cpi.tokenUrl;
+        values.CPI_API_BASE_URL = cpi.apiBaseUrl;
+        values.CPI_PACKAGE_ID = cpi.packageId;
+      }
+
+      // Effective immediately, no restart needed
+      for (const [key, value] of Object.entries(values)) {
+        if (value === null) {
+          delete process.env[key];
+        } else {
+          process.env[key] = value;
+        }
+      }
+
+      // Test so the user sees the status of each model
+      const tests = [await testSlot(primary)];
+
+      if (secondary.apiKey) {
+        tests.push(await testSlot(secondary));
+      }
+
+      if (hasCpi) {
+        tests.push(await testCpi(cpi));
+      }
+
+      // Written last: `cds watch` restarts the server when .env
+      // changes, which would otherwise cut off the tests above
+      try {
+        writeEnvFile(values);
+      } catch (e) {
+        return req.error(
+          500,
+          `Could not write ${ENV_FILE}: ${e.message}`
+        );
+      }
+
+      return Object.assign(
+        getSetupStatus(),
+        { tests }
+      );
+    }
+  );
+
+  // ============================================================
   // AI -> COMPILER JSON
   //
   // Retries after actual compiler/factory/validation errors.
   // ============================================================
+
+  /*
+   * The AI leaves environment-specific values (endpoint URLs, credential
+   * names) empty -- the user selects them afterwards. Check the draft with
+   * well-formed stand-ins filled in, so missing values never count as
+   * compiler errors. The stand-ins are never compiled into a ZIP.
+   */
+  function draftFlowFromJson(aiJson) {
+    return fromJson(
+      withDraftPlaceholders(
+        normalizeResourceNames(aiJson)
+      )
+    );
+  }
 
   async function generateCompilerJson(prompt) {
 
@@ -594,53 +1216,21 @@ Return ONLY the complete compiler JSON.
       // AI HUB CALL
       // ========================================================
 
-      try {
+      response =
+        await callAiWithFallback({
+          temperature: 0,
 
-        response =
-          await axios.post(
-            "https://adesso-ai-hub.3asabc.de/v1/chat/completions",
+          messages: [
             {
-              model:
-                "gemma-4-26b-sovereign",
-
-              temperature: 0,
-
-              messages: [
-                {
-                  role: "system",
-                  content: systemPrompt
-                },
-                {
-                  role: "user",
-                  content: currentPrompt
-                }
-              ]
+              role: "system",
+              content: systemPrompt
             },
             {
-              headers: {
-                Authorization:
-                  `Bearer ${process.env.AI_HUB_API_KEY}`,
-
-                "Content-Type":
-                  "application/json"
-              }
+              role: "user",
+              content: currentPrompt
             }
-          );
-
-      } catch (error) {
-
-        console.error(
-          "AI request failed:",
-          error.response?.data ||
-          error.message
-        );
-
-        throw new Error(
-          error.response?.data?.error?.message ||
-          error.message ||
-          "AI request failed"
-        );
-      }
+          ]
+        });
 
 
       // ========================================================
@@ -764,7 +1354,7 @@ Return ONLY JSON.
       try {
 
         flow =
-          fromJson(aiJson);
+          draftFlowFromJson(aiJson);
 
       } catch (error) {
 
@@ -1057,6 +1647,21 @@ async function buildFlow(prompt) {
 
     aiJson =
         normalizeResourceNames(aiJson);
+
+    // Environment values the AI left empty must be chosen by the user
+    // first (draftFlow -> completeFlow) -- never compile a ZIP without them.
+    const missing =
+        getRequiredInputs(aiJson);
+
+    if (missing.length > 0) {
+
+        throw new Error(
+            "This flow needs values you have to select first: " +
+            missing.map(i => i.label).join("; ") +
+            ". Generate the flow first and select them in the " +
+            "\"Complete configuration\" dialog, or name them in the prompt."
+        );
+    }
 
     let flow;
 
@@ -1354,6 +1959,704 @@ async function buildFlow(prompt) {
           500,
           error.message ||
           "ZIP download failed"
+        );
+      }
+    }
+  );
+
+  // ============================================================
+  // DRAFT FLOW
+  //
+  // Prompt -> AI draft + the environment inputs (security material,
+  // endpoints) the user still has to select. No ZIP yet.
+  // ============================================================
+
+  this.on(
+    "draftFlow",
+    async (req) => {
+
+      const prompt =
+        req.data?.prompt;
+
+      if (!prompt) {
+        return req.error(
+          400,
+          "Prompt is required"
+        );
+      }
+
+      try {
+
+        const draft =
+          normalizeResourceNames(
+            await generateCompilerJson(prompt)
+          );
+
+        const inputs =
+          getRequiredInputs(
+            draft,
+            { onlyMissing: false }
+          );
+
+        return JSON.stringify({
+          flowName:
+            draft.name ||
+            "AIGeneratedFlow",
+          draft,
+          inputs,
+          tenantConfigured:
+            tenant.isTenantConfigured()
+        });
+
+      } catch (error) {
+
+        console.error(
+          "\n===== DRAFT ERROR =====\n",
+          error
+        );
+
+        return req.error(
+          500,
+          error.message ||
+          "Draft generation failed"
+        );
+      }
+    }
+  );
+
+
+  // ============================================================
+  // LIST SECURITY MATERIAL
+  //
+  // Real names from the CPI tenant for one kind (UserCredential,
+  // OAuth2ClientCredential, KeystoreAlias).
+  // ============================================================
+
+  this.on(
+    "listSecurityMaterial",
+    async (req) => {
+
+      const kind =
+        req.data?.kind;
+
+      if (
+        !tenant.SECURITY_MATERIAL_KINDS.includes(kind)
+      ) {
+        return req.error(
+          400,
+          `kind must be one of: ${tenant.SECURITY_MATERIAL_KINDS.join(", ")}`
+        );
+      }
+
+      try {
+
+        return JSON.stringify(
+          await tenant.listSecurityMaterial(kind)
+        );
+
+      } catch (error) {
+
+        const status =
+          error.response?.status;
+
+        console.error(
+          `Security material lookup failed (${kind}):`,
+          status || "",
+          error.message
+        );
+
+        return req.error(
+          status === 401 || status === 403 ? 403 : 502,
+          status === 401 || status === 403
+            ? "The CPI API service key is not allowed to read security material."
+            : error.message
+        );
+      }
+    }
+  );
+
+
+  // ============================================================
+  // COMPLETE FLOW
+  //
+  // Approved draft + the user's selections -> validated ZIP.
+  // The AI is NOT called again, so the flow the user reviewed is
+  // exactly the flow that gets compiled.
+  // ============================================================
+
+  this.on(
+    "completeFlow",
+    async (req) => {
+
+      let draft;
+      let values;
+
+      try {
+
+        draft =
+          JSON.parse(req.data?.draft || "null");
+
+        values =
+          JSON.parse(req.data?.inputs || "{}");
+
+      } catch {
+
+        return req.error(
+          400,
+          "draft and inputs must be JSON strings"
+        );
+      }
+
+      if (!draft || typeof draft !== "object") {
+        return req.error(
+          400,
+          "draft is required"
+        );
+      }
+
+      try {
+
+        const completed =
+          applyInputs(
+            normalizeResourceNames(draft),
+            values
+          );
+
+        const stillMissing =
+          getRequiredInputs(completed);
+
+        if (stillMissing.length > 0) {
+          return req.error(
+            400,
+            "Please fill in: " +
+            stillMissing.map(i => i.label).join("; ")
+          );
+        }
+
+        // Selected credentials must actually exist on the tenant.
+        if (tenant.isTenantConfigured()) {
+
+          const credentialInputs =
+            getRequiredInputs(
+              completed,
+              { onlyMissing: false }
+            ).filter(i =>
+              tenant.SECURITY_MATERIAL_KINDS.includes(i.kind)
+            );
+
+          for (const input of credentialInputs) {
+
+            const available =
+              await tenant.listSecurityMaterial(input.kind);
+
+            if (
+              !available.some(m => m.name === input.currentValue)
+            ) {
+              return req.error(
+                400,
+                `${input.label}: "${input.currentValue}" does not exist on the tenant`
+              );
+            }
+          }
+        }
+
+        const flow =
+          fromJson(completed);
+
+        const validation =
+          validate(flow);
+
+        if (!validation.valid) {
+          return req.error(
+            400,
+            JSON.stringify(validation)
+          );
+        }
+
+        const zip =
+          await compileToZip(flow);
+
+        return JSON.stringify({
+          flowName:
+            completed.name ||
+            "AIGeneratedFlow",
+          fileName:
+            `${completed.name || "AIGeneratedFlow"}.zip`,
+          compilerJson:
+            completed,
+          zipBase64:
+            Buffer.from(zip).toString("base64")
+        });
+
+      } catch (error) {
+
+        console.error(
+          "\n===== COMPLETE ERROR =====\n",
+          error
+        );
+
+        return req.error(
+          400,
+          error.message ||
+          "Compilation failed"
+        );
+      }
+    }
+  );
+
+  // ============================================================
+  // CPI DEPLOYMENT
+  //
+  // Uses @david10ten/deployer. Credentials come from the
+  // Settings dialog (CPI_* in .env) or a bound it-rt service.
+  //
+  // Deployments run in the background; the UI polls
+  // deploymentStatus. Failed deployments keep the prompt and
+  // the SAP error so "Fix & Redeploy" can feed the error back
+  // to the AI and deploy the corrected flow.
+  // ============================================================
+
+  const DEFAULT_PACKAGE_ID =
+    "cpipackage";
+
+  const MAX_DEPLOY_ATTEMPTS = 5;
+
+  // In-memory only; lost on restart, which is fine for a dev tool
+  const deployments = new Map();
+  let nextDeploymentId = 1;
+
+  function getDeployer() {
+    // Created per call so changes from the Settings dialog
+    // apply immediately
+    return new CpiDeployer();
+  }
+
+  function toBuffer(zip) {
+
+    if (Buffer.isBuffer(zip)) {
+      return zip;
+    }
+
+    if (zip instanceof Uint8Array || zip instanceof ArrayBuffer) {
+      return Buffer.from(zip);
+    }
+
+    throw new Error(
+      `compileToZip returned unsupported type: ${
+        zip?.constructor?.name || typeof zip
+      }`
+    );
+  }
+
+  // Same rule the compiler uses for Bundle-SymbolicName, so the
+  // designtime artifact id matches the ZIP's manifest
+  function artifactIdFor(flowName) {
+    return String(flowName || "GeneratedFlow").replace(/\s+/g, "_");
+  }
+
+  function describeCpiError(error) {
+
+    const status =
+      error.response?.status;
+
+    const data =
+      error.response?.data;
+
+    const sapMessage =
+      data?.error?.message?.value ||
+      data?.error?.message ||
+      (typeof data === "string" ? data.slice(0, 500) : null);
+
+    if (status === 401) {
+      return "CPI rejected the credentials (HTTP 401). Check client ID, secret and token URL in Settings.";
+    }
+
+    if (status === 403) {
+      return `CPI denied access (HTTP 403). ${sapMessage || "Check that the service key has the API plan and the required roles."}`;
+    }
+
+    if (status) {
+      return `CPI answered with HTTP ${status}: ${sapMessage || error.message}`;
+    }
+
+    return error.message;
+  }
+
+  function errorText(detail) {
+
+    if (!detail) {
+      return null;
+    }
+
+    if (typeof detail === "string") {
+      return detail;
+    }
+
+    // Shape: { message: { messageText, ... }, parameter: [...] }
+    const text =
+      detail.message?.messageText ||
+      detail.messageText;
+
+    const params =
+      Array.isArray(detail.parameter)
+        ? detail.parameter.filter(Boolean).join("\n")
+        : "";
+
+    if (text) {
+      return params ? `${text}\n${params}` : text;
+    }
+
+    return JSON.stringify(detail, null, 2);
+  }
+
+  function publicDeployment(d) {
+    return {
+      deploymentId: d.deploymentId,
+      artifactId: d.artifactId,
+      artifactName: d.artifactName,
+      packageId: d.packageId,
+      status: d.status,
+      phase: d.phase,
+      attempt: d.attempts.length,
+      maxAttempts: MAX_DEPLOY_ATTEMPTS,
+      canFix:
+        ["ERROR", "TIMEOUT", "FAILED"].includes(d.status) &&
+        d.attempts.length < MAX_DEPLOY_ATTEMPTS,
+      error: d.error || null,
+      errorDetail: d.errorDetail || null,
+      updatedAt: d.updatedAt
+    };
+  }
+
+  function updateDeployment(d, changes) {
+    Object.assign(d, changes, { updatedAt: new Date().toISOString() });
+  }
+
+  // Builds the prompt for a fix attempt: original request plus
+  // the previous JSON and SAP's error, so the AI can correct it
+  function buildFixPrompt(d) {
+
+    const last =
+      d.attempts[d.attempts.length - 1];
+
+    return `
+The integration flow below was generated for this request and then
+deployed to SAP Cloud Integration, but the deployment FAILED.
+
+ORIGINAL USER REQUEST:
+${d.prompt}
+
+PREVIOUS COMPILER JSON:
+${JSON.stringify(last.aiJson, null, 2)}
+
+SAP DEPLOYMENT ERROR:
+${last.error}
+
+Fix the cause of the deployment error. Keep the flow name
+"${last.aiJson?.name}" unchanged so the existing artifact is updated.
+
+Return the COMPLETE corrected compiler JSON.
+
+Return ONLY JSON.
+`;
+  }
+
+  // Rebuilds a flow from the compiler JSON that completeFlow returned
+  function compilePrebuilt(aiJson) {
+
+    let flow;
+
+    try {
+      flow = fromJson(aiJson);
+    } catch (error) {
+      throw new Error(`Invalid compiler JSON: ${error.message}`);
+    }
+
+    const validation = validate(flow);
+
+    if (!validation.valid) {
+      throw new Error(JSON.stringify(validation));
+    }
+
+    return { aiJson, flow };
+  }
+
+  async function runDeployment(d, prompt, prebuiltJson) {
+
+    const attempt = { startedAt: new Date().toISOString() };
+    d.attempts.push(attempt);
+
+    try {
+
+      updateDeployment(d, {
+        status: "RUNNING",
+        phase: prebuiltJson
+          ? "Preparing the generated integration flow..."
+          : "Generating the integration flow with AI...",
+        error: null,
+        errorDetail: null
+      });
+
+      // A flow the user already generated/approved is deployed as is;
+      // only fix attempts and prompt-only requests go through the AI.
+      const { aiJson, flow } =
+        prebuiltJson
+          ? compilePrebuilt(prebuiltJson)
+          : await buildFlow(prompt);
+
+      attempt.aiJson = aiJson;
+
+      // First attempt fixes the artifact id; fix attempts must
+      // keep it so the same artifact is updated
+      if (!d.artifactId) {
+        d.artifactId = artifactIdFor(flow.name);
+        d.artifactName = flow.name;
+      } else if (artifactIdFor(flow.name) !== d.artifactId) {
+        flow.name = d.artifactName;
+        aiJson.name = d.artifactName;
+      }
+
+      updateDeployment(d, { phase: "Compiling the iFlow ZIP..." });
+
+      const zipBuffer =
+        toBuffer(await compileToZip(flow));
+
+      const deployer =
+        getDeployer();
+
+      // Fails fast with a clear message when credentials are missing
+      deployer.getCredentials();
+
+      updateDeployment(d, {
+        phase: `Uploading "${d.artifactId}" to package "${d.packageId}"...`
+      });
+
+      await deployer.createOrUpdateArtifact({
+        id: d.artifactId,
+        name: d.artifactName,
+        packageId: d.packageId,
+        zipBase64: zipBuffer.toString("base64")
+      });
+
+      updateDeployment(d, { phase: "Deploying on the CPI tenant..." });
+
+      await deployer.deployArtifact(d.artifactId);
+
+      updateDeployment(d, {
+        phase: "Waiting for the runtime status (this can take a minute)..."
+      });
+
+      const result =
+        await deployer.pollDeploymentStatus(d.artifactId, {
+          timeoutMs: 180000,
+          intervalMs: 5000
+        });
+
+      if (result.status === "STARTED") {
+        attempt.status = "STARTED";
+        updateDeployment(d, {
+          status: "STARTED",
+          phase: "Deployed and started successfully."
+        });
+        return;
+      }
+
+      if (result.status === "TIMEOUT") {
+        attempt.status = "TIMEOUT";
+        attempt.error =
+          "Deployment did not reach a final status within 3 minutes. " +
+          "It may still be starting; check the Integration Suite monitor.";
+        updateDeployment(d, {
+          status: "TIMEOUT",
+          phase: "Status check timed out.",
+          error: attempt.error
+        });
+        return;
+      }
+
+      // ERROR: pull the details SAP reports for the artifact
+      updateDeployment(d, { phase: "Deployment failed, fetching SAP error details..." });
+
+      let detail = null;
+
+      try {
+        detail = await deployer.getArtifactError(d.artifactId);
+      } catch (e) {
+        console.error("Could not load artifact error:", describeCpiError(e));
+      }
+
+      attempt.status = "ERROR";
+      attempt.error =
+        errorText(detail) ||
+        "SAP reported a deployment error but returned no details. " +
+        "Check adapter configuration and required properties.";
+
+      updateDeployment(d, {
+        status: "ERROR",
+        phase: "Deployment failed.",
+        error: attempt.error,
+        errorDetail:
+          detail && typeof detail === "object"
+            ? JSON.stringify(detail, null, 2)
+            : null
+      });
+
+    } catch (error) {
+
+      console.error("Deployment failed:", error);
+
+      attempt.status = "FAILED";
+      attempt.error =
+        error.response ? describeCpiError(error) : error.message;
+
+      updateDeployment(d, {
+        status: "FAILED",
+        phase: "Deployment could not be completed.",
+        error: attempt.error
+      });
+    }
+  }
+
+  this.on(
+    "deployFlow",
+    async (req) => {
+
+      const prompt =
+        (req.data?.prompt || "").trim();
+
+      let flowJson = null;
+
+      if (req.data?.flowJson) {
+        try {
+          flowJson = JSON.parse(req.data.flowJson);
+        } catch {
+          return req.error(400, "flowJson must be a JSON string");
+        }
+        if (!flowJson || typeof flowJson !== "object") {
+          return req.error(400, "flowJson must be a JSON object");
+        }
+      }
+
+      if (!prompt && !flowJson) {
+        return req.error(400, "Prompt is required");
+      }
+
+      const d = {
+        deploymentId: String(nextDeploymentId++),
+        prompt: prompt || flowJson.name || "",
+        packageId:
+          (req.data.packageId || "").trim() ||
+          process.env.CPI_PACKAGE_ID ||
+          DEFAULT_PACKAGE_ID,
+        artifactId: null,
+        artifactName: null,
+        attempts: [],
+        status: "RUNNING",
+        phase: "Queued..."
+      };
+
+      deployments.set(d.deploymentId, d);
+
+      // Not awaited: the UI polls deploymentStatus
+      runDeployment(d, prompt, flowJson);
+
+      return publicDeployment(d);
+    }
+  );
+
+  this.on(
+    "fixAndRedeploy",
+    async (req) => {
+
+      const d =
+        deployments.get(req.data?.deploymentId);
+
+      if (!d) {
+        return req.error(404, "Unknown deployment. It may have been lost after a server restart.");
+      }
+
+      if (d.status === "RUNNING") {
+        return req.error(409, "This deployment is still running.");
+      }
+
+      if (!publicDeployment(d).canFix) {
+        return req.error(
+          400,
+          d.attempts.length >= MAX_DEPLOY_ATTEMPTS
+            ? `Maximum of ${MAX_DEPLOY_ATTEMPTS} attempts reached. Adjust the scenario and deploy again.`
+            : "This deployment has not failed, nothing to fix."
+        );
+      }
+
+      const last =
+        d.attempts[d.attempts.length - 1];
+
+      // If the AI step itself failed there is no JSON to correct,
+      // so retry with the original prompt
+      const prompt =
+        last.aiJson ? buildFixPrompt(d) : d.prompt;
+
+      updateDeployment(d, { status: "RUNNING", phase: "Queued for fix..." });
+
+      runDeployment(d, prompt);
+
+      return publicDeployment(d);
+    }
+  );
+
+  this.on(
+    "deploymentStatus",
+    (req) => {
+
+      const d =
+        deployments.get(req.data?.deploymentId);
+
+      if (!d) {
+        return req.error(404, "Unknown deployment. It may have been lost after a server restart.");
+      }
+
+      return publicDeployment(d);
+    }
+  );
+
+  // Flows currently in ERROR on the tenant, with SAP's reason
+  this.on(
+    "listDeploymentErrors",
+    async (req) => {
+
+      try {
+
+        const deployer =
+          getDeployer();
+
+        const artifacts =
+          await deployer.listArtifacts({ status: "ERROR" });
+
+        return Promise.all(
+          artifacts.map(async (a) => {
+
+            let error = null;
+
+            try {
+              error = errorText(await deployer.getArtifactError(a.Id));
+            } catch (e) {
+              error = `Could not load details: ${describeCpiError(e)}`;
+            }
+
+            return {
+              artifactId: a.Id,
+              artifactName: a.Name,
+              deployedBy: a.DeployedBy,
+              deployedOn: a.DeployedOn,
+              error: error || "No details reported by SAP."
+            };
+          })
+        );
+
+      } catch (error) {
+        return req.error(
+          error.response ? 502 : 400,
+          error.response ? describeCpiError(error) : error.message
         );
       }
     }
